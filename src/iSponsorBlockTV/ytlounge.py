@@ -71,6 +71,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self.skip_ads = config.skip_ads
             self.auto_play = config.auto_play
         self._command_mutex = asyncio.Lock()
+        # Mute state tracking for reliability
+        self._desired_mute_state = None  # Track what mute state we want
+        self._mute_retry_count = 0  # Track mute command retries
+        self._max_mute_retries = 3  # Max retries for mute commands
+        self._mute_watchdog_task = None  # Task for mute state watchdog
 
     async def _handle_playback_state_event(self, event: PlaybackStateEvent) -> None:
         self._playback_state.currentTime = event.current_time
@@ -136,6 +141,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Stop existing mute watchdog if running
+        if self._mute_watchdog_task and not self._mute_watchdog_task.done():
+            self._mute_watchdog_task.cancel()
+            try:
+                await self._mute_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Start new subscription
         if self.subscribe_task and not self.subscribe_task.done():
             self.subscribe_task.cancel()
@@ -146,6 +159,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
 
         self.subscribe_task = asyncio.create_task(super().subscribe())
         self.subscribe_task_watchdog = asyncio.create_task(self._watchdog())
+        # Start mute watchdog for state consistency
+        self._mute_watchdog_task = asyncio.create_task(self._mute_watchdog())
         return self.subscribe_task
 
     # Process a lounge subscription event
@@ -163,27 +178,27 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             # print(data)
             # Unmute when the video starts playing
             if self.mute_ads and data["state"] == "1":
-                create_task(self.mute(False, override=True))
+                create_task(self._safe_mute(False))
         elif event_type == "nowPlaying":
             data = args[0]
             # Unmute when the video starts playing
             if self.mute_ads and data.get("state", "0") == "1":
                 self.logger.info("Ad has ended, unmuting")
-                create_task(self.mute(False, override=True))
+                create_task(self._safe_mute(False))
         elif event_type == "onAdStateChange":
             data = args[0]
             if data["adState"] == "0" and data["currentTime"] != "0":  # Ad is not playing
                 self.logger.info("Ad has ended, unmuting")
-                create_task(self.mute(False, override=True))
+                create_task(self._safe_mute(False))
             elif (
                 self.skip_ads and data["isSkipEnabled"] == "true"
             ):  # YouTube uses strings for booleans
                 self.logger.info("Ad can be skipped, skipping")
                 create_task(self.skip_ad())
-                create_task(self.mute(False, override=True))
+                create_task(self._safe_mute(False))
             elif self.mute_ads:  # Seen multiple other adStates, assuming they are all ads
                 self.logger.info("Ad has started, muting")
-                create_task(self.mute(True, override=True))
+                create_task(self._safe_mute(True))
         # Manages volume, useful since YouTube wants to know the volume
         # when unmuting (even if they already have it)
         elif event_type == "onVolumeChanged":
@@ -207,10 +222,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             ):  # YouTube uses strings for booleans
                 self.logger.info("Ad can be skipped, skipping")
                 create_task(self.skip_ad())
-                create_task(self.mute(False, override=True))
+                create_task(self._safe_mute(False))
             elif self.mute_ads:  # Seen multiple other adStates, assuming they are all ads
                 self.logger.info("Ad has started, muting")
-                create_task(self.mute(True, override=True))
+                create_task(self._safe_mute(True))
 
         elif event_type == "loungeStatus":
             data = args[0]
@@ -249,26 +264,74 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
 
     async def mute(self, mute: bool, override: bool = False) -> None:
         """
-        Mute or unmute the device (if the device already
-        is in the desired state, nothing happens)
+        Mute or unmute the device with retry logic.
+        Tracks desired state and retries if command fails.
 
         :param bool mute: True to mute, False to unmute
         :param bool override: If True, the command is sent even if the
         device already is in the desired state
-
-        TODO: Only works if the device is subscribed to the lounge
         """
-        if mute:
-            mute_str = "true"
-        else:
-            mute_str = "false"
-        if override or not self.volume_state.get("muted", "false") == mute_str:
-            self.volume_state["muted"] = mute_str
-            # YouTube wants the volume when unmuting, so we send it
-            await self._command(
-                "setVolume",
-                {"volume": self.volume_state.get("volume", 100), "muted": mute_str},
-            )
+        # Update desired state
+        self._desired_mute_state = mute
+
+        # Don't spam if already in desired state (unless override)
+        current_muted = self.volume_state.get("muted", "false") == "true"
+        if not override and current_muted == mute:
+            return
+
+        mute_str = "true" if mute else "false"
+        volume = self.volume_state.get("volume", 100)
+
+        async def send_mute_command():
+            try:
+                await self._command(
+                    "setVolume",
+                    {"volume": volume, "muted": mute_str},
+                )
+                # Update local state on success
+                self.volume_state["muted"] = mute_str
+                self._mute_retry_count = 0
+                self.logger.debug(f"Mute {'on' if mute else 'off'} command succeeded")
+            except Exception as e:
+                self.logger.warning(f"Mute {'on' if mute else 'off'} command failed: {e}")
+                self._mute_retry_count += 1
+                return False
+            return True
+
+        # Try immediately first
+        if await send_mute_command():
+            return
+
+        # Retry with backoff if failed
+        for attempt in range(self._max_mute_retries):
+            if self._mute_retry_count > self._max_mute_retries:
+                break
+            await asyncio.sleep(1 * (attempt + 1))  # 1s, 2s, 3s backoff
+            if await send_mute_command():
+                return
+
+        self.logger.error(
+            f"Failed to {'mute' if mute else 'unmute'} after {self._max_mute_retries} retries"
+        )
+
+    async def _safe_mute(self, mute: bool):
+        """Wrapper for mute with state tracking and logging"""
+        if self._desired_mute_state != mute:
+            self.logger.info(f"{'Muting' if mute else 'Unmuting'} due to ad state change")
+            await self.mute(mute, override=True)
+
+    async def _mute_watchdog(self):
+        """Periodically checks if mute state matches desired state"""
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            if self._desired_mute_state is not None:
+                current_muted = self.volume_state.get("muted", "false") == "true"
+                if current_muted != self._desired_mute_state:
+                    self.logger.info(
+                        f"Mute state mismatch detected: desired={self._desired_mute_state}, "
+                        f"current={current_muted}. Retrying..."
+                    )
+                    await self.mute(self._desired_mute_state, override=True)
 
     async def play_video(self, video_id: str) -> bool:
         return await self._command("setPlaylist", {"videoId": video_id})

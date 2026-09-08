@@ -41,28 +41,44 @@ class DeviceListener:
     # Main subscription loop
     async def loop(self):
         lounge_controller = self.lounge_controller
+        retry_delay = 2  # Start with 2s delay for faster reconnection
+        max_retry_delay = 10  # Max 10s delay
+
         while not self.cancelled:
-            while not lounge_controller.linked():
+            # Check linked status with exponential backoff
+            while not lounge_controller.linked() and not self.cancelled:
                 try:
                     self.logger.debug("Refreshing auth")
                     await lounge_controller.refresh_auth()
                 except BaseException:
-                    await asyncio.sleep(10)
-            while not (await self.is_available()) and not self.cancelled:
-                self.logger.debug("Waiting for device to be available")
-                await asyncio.sleep(10)
-            try:
-                await lounge_controller.connect()
-            except BaseException:
-                pass
-            while not lounge_controller.connected() and not self.cancelled:
-                # Doesn't connect to the device if it's a kids profile (it's broken)
-                self.logger.debug("Waiting for device to be connected")
-                await asyncio.sleep(10)
-                try:
-                    await lounge_controller.connect()
-                except BaseException:
                     pass
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, max_retry_delay)  # Exponential backoff
+
+            retry_delay = 2  # Reset backoff on successful link
+
+            # Check availability and connect with backoff
+            while not self.cancelled:
+                is_available = await self.is_available()
+
+                if is_available:
+                    try:
+                        await lounge_controller.connect()
+                    except BaseException:
+                        pass
+
+                    if lounge_controller.connected():
+                        break
+
+                self.logger.debug("Waiting for device to be available/connected")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, max_retry_delay)
+
+            retry_delay = 2  # Reset backoff on successful connection
+
+            if self.cancelled:
+                break
+
             self.logger.info(
                 "Connected to device %s (%s)", lounge_controller.screen_name, self.name
             )
@@ -72,6 +88,8 @@ class DeviceListener:
                 await sub
             except BaseException:
                 pass
+
+            retry_delay = 2  # Reset backoff after disconnection
 
     # Method called on playback state change
     async def __call__(self, state):
