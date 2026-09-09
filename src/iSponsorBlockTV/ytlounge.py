@@ -111,10 +111,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                         f"Watchdog triggered: No events for {time_since_last_event:.1f} seconds"
                     )
 
+                    # Clear connection state so main loop will reconnect
+                    self._connection_lost()
+
                     # Cancel current subscription
                     if self.subscribe_task and not self.subscribe_task.done():
                         self.subscribe_task.cancel()
                         await asyncio.sleep(1)  # Give it time to cancel
+                        break  # Exit watchdog loop after triggering disconnect
         except asyncio.CancelledError:
             self.logger.debug("Watchdog task cancelled")
             self.watchdog_running = False

@@ -70,7 +70,7 @@ class DeviceListener:
                 self.logger.debug("Subscribing to lounge")
                 sub = await lounge_controller.subscribe_monitored(self)
                 await sub
-            except BaseException:
+            except (asyncio.CancelledError, Exception):
                 pass
 
     # Method called on playback state change
