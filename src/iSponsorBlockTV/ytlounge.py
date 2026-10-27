@@ -67,8 +67,6 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.watchdog_running = False
         self.last_event_time = 0
         if config:
-            self.mute_ads = config.mute_ads
-            self.skip_ads = config.skip_ads
             self.auto_play = config.auto_play
         self.mute_ads = config.mute_ads if config else False
         self.skip_ads = config.skip_ads if config else False
@@ -77,6 +75,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._mute_target = None
         self._mute_task = None
         self._skip_tasks = set()
+        self._prefetch_tasks = {}
         self._command_mutex = asyncio.Lock()
 
     async def _handle_playback_state_event(self, event: PlaybackStateEvent) -> None:
@@ -158,7 +157,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     # Process a lounge subscription event
     # skipcq: PY-R1000
     async def _process_event(self, event_type: str, args: List[Any]):
-        self.logger.debug(f"process_event({event_type}, {args})")
+        self.logger.debug("process_event(%s, %s)", event_type, args)
         # Update last event time for the watchdog
         self.last_event_time = asyncio.get_running_loop().time()
 
@@ -187,7 +186,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "autoplayUpNext":
             if len(args) > 0 and (vid_id := args[0]["videoId"]):  # if video id is not empty
                 self.logger.info(f"Getting segments for next video: {vid_id}")
-                create_task(self.api_helper.get_segments(vid_id))
+                self._prefetch_segments(vid_id)
 
         # #Used to know if an ad is skippable or not
         elif event_type == "adPlaying":
@@ -195,7 +194,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             # Gets segments for the next video (after the ad) before it starts playing
             if vid_id := data.get("contentVideoId"):
                 self.logger.info(f"Getting segments for next video: {vid_id}")
-                create_task(self.api_helper.get_segments(vid_id))
+                self._prefetch_segments(vid_id)
             self._start_ad(data)
 
         elif event_type == "loungeStatus":
@@ -229,6 +228,18 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
 
         await super()._process_event(event_type, args)
 
+    def _prefetch_segments(self, video_id):
+        if video_id in self._prefetch_tasks:
+            return
+        task = create_task(self.api_helper.get_segments(video_id))
+        self._prefetch_tasks[video_id] = task
+        task.add_done_callback(lambda done: self._prefetch_finished(video_id, done))
+
+    def _prefetch_finished(self, video_id, task):
+        self._prefetch_tasks.pop(video_id, None)
+        if not task.cancelled() and task.exception():
+            self.logger.debug("Segment prefetch failed for %s: %s", video_id, task.exception())
+
     def _start_ad(self, data):
         self._ad_active = True
         if self.mute_ads:
@@ -237,7 +248,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 self._ad_muted = str(self.volume_state.get("muted", "false")).lower() != "true"
             if self._ad_muted:
                 self._request_mute(True)
-        if self.skip_ads and str(data.get("isSkipEnabled")).lower() == "true":
+        if (
+            self.skip_ads
+            and str(data.get("isSkipEnabled")).lower() == "true"
+            and not self._skip_tasks
+        ):
             task = create_task(self._skip_ad_safely())
             self._skip_tasks.add(task)
             task.add_done_callback(self._skip_tasks.discard)
@@ -280,6 +295,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self.subscribe_task_watchdog,
             self._mute_task,
             *self._skip_tasks,
+            *self._prefetch_tasks.values(),
         ]
         tasks = [task for task in tasks if task is not None]
         for task in tasks:

@@ -1,13 +1,13 @@
 import html
 from hashlib import sha256
-from asyncio import FIRST_COMPLETED, Task, create_task, wait
+from asyncio import FIRST_COMPLETED, Task, create_task, gather, wait
 from typing import AsyncIterator, Collection, TypeVar
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 from cache import AsyncLRU
 from pyytlounge.wrapper import api_base
 
-from . import chromecast_client, constants, dial_client
+from . import constants
 from .conditional_ttl_cache import AsyncConditionalTTL
 
 
@@ -49,6 +49,11 @@ async def merge_iterators(iterators: Collection[AsyncIterator[_T]]) -> AsyncIter
     finally:
         for task in pending_tasks:
             task.cancel()
+        await gather(*pending_tasks, return_exceptions=True)
+        await gather(
+            *(iterator.aclose() for iterator in iterators if hasattr(iterator, "aclose")),
+            return_exceptions=True,
+        )
 
 
 # Class that handles all the api calls and their cache
@@ -153,24 +158,28 @@ class ApiHelper:
         if "error" in data:
             return channels
 
-        for i in data["items"]:
-            # Get channel subscription number
-            params = {
-                "id": i["snippet"]["channelId"],
-                "key": self.apikey,
-                "part": "statistics",
-            }
-            url = constants.Youtube_api + "channels"
-            async with self.web_session.get(url, params=params) as resp:
-                channel_data = await resp.json()
-
-            if channel_data["items"][0]["statistics"]["hiddenSubscriberCount"]:
-                sub_count = "Hidden"
-            else:
-                sub_count = int(channel_data["items"][0]["statistics"]["subscriberCount"])
-                sub_count = format(sub_count, "_")
-
-            channels.append((i["snippet"]["channelId"], i["snippet"]["channelTitle"], sub_count))
+        items = data.get("items", [])
+        if not items:
+            return channels
+        # YouTube accepts multiple channel IDs in one statistics request.
+        params = {
+            "id": ",".join(i["snippet"]["channelId"] for i in items),
+            "key": self.apikey,
+            "part": "statistics",
+        }
+        async with self.web_session.get(constants.Youtube_api + "channels", params=params) as resp:
+            channel_data = await resp.json()
+        statistics = {i["id"]: i.get("statistics", {}) for i in channel_data.get("items", [])}
+        for item in items:
+            channel_id = item["snippet"]["channelId"]
+            stats = statistics.get(channel_id, {})
+            count = stats.get("subscriberCount")
+            sub_count = (
+                "Hidden"
+                if stats.get("hiddenSubscriberCount") or count is None
+                else format(int(count), "_")
+            )
+            channels.append((channel_id, item["snippet"]["channelTitle"], sub_count))
         return channels
 
     @list_to_tuple  # Convert list to tuple so it can be used as a key in the cache
@@ -194,70 +203,33 @@ class ApiHelper:
         }
         headers = {"Accept": "application/json"}
         url = self.sponsorblock_api_url + "skipSegments/" + vid_id_hashed
-        async with self.web_session.get(url, headers=headers, params=params) as response:
+        async with self.web_session.get(
+            url, headers=headers, params=params, timeout=ClientTimeout(total=15)
+        ) as response:
+            if response.status == 404:
+                return [], False  # A video can acquire segments later.
+            response.raise_for_status()  # Never cache transient server/rate-limit errors.
             response_json = await response.json()
-        if response.status != 200:
-            response_text = await response.text()
-            print(
-                f"Error getting segments for video {vid_id}, hashed as {vid_id_hashed}."
-                f" Code: {response.status} - {response_text}"
-            )
-            return [], True
-        for i in response_json:
-            if str(i["videoID"]) == str(vid_id):
-                response_json = i
-                break
-        return self.process_segments(response_json, self.minimum_skip_length)
+        for item in response_json:
+            if str(item["videoID"]) == str(vid_id):
+                return self.process_segments(item, self.minimum_skip_length)
+        return [], False
 
     @staticmethod
     def process_segments(response, minimum_skip_length):
+        """Merge intervals in O(n log n), without mutating the API response."""
+        raw = response.get("segments", []) if isinstance(response, dict) else []
+        ignore_ttl = bool(raw) and all(item.get("locked") == 1 for item in raw)
         segments = []
-        ignore_ttl = True
-        try:
-            response_segments = response["segments"]
-            # sort by end
-            response_segments.sort(key=lambda x: x["segment"][1])
-            # extend ends of overlapping segments to make one big segment
-            for i in response_segments:
-                for j in response_segments:
-                    if j["segment"][0] <= i["segment"][1] <= j["segment"][1]:
-                        i["segment"][1] = j["segment"][1]
-
-            # sort by start
-            response_segments.sort(key=lambda x: x["segment"][0])
-            # extend starts of overlapping segments to make one big segment
-            for i in reversed(response_segments):
-                for j in reversed(response_segments):
-                    if j["segment"][0] <= i["segment"][0] <= j["segment"][1]:
-                        i["segment"][0] = j["segment"][0]
-
-            for i in response_segments:
-                ignore_ttl = (
-                    ignore_ttl and i["locked"] == 1
-                )  # If all segments are locked, ignore ttl
-                segment = i["segment"]
-                UUID = i["UUID"]
-                segment_dict = {"start": segment[0], "end": segment[1], "UUID": [UUID]}
-                try:
-                    # Get segment before to check if they are too close to each other
-                    segment_before_end = segments[-1]["end"]
-                    segment_before_start = segments[-1]["start"]
-                    segment_before_UUID = segments[-1]["UUID"]
-
-                except IndexError:
-                    segment_before_end = -10
-                if (
-                    segment_dict["start"] - segment_before_end < 1
-                ):  # Less than 1 second apart, combine them and skip them together
-                    segment_dict["start"] = segment_before_start
-                    segment_dict["UUID"].extend(segment_before_UUID)
-                    segments.pop()
-                # Only add segments greater than minimum skip length
-                if segment_dict["end"] - segment_dict["start"] > minimum_skip_length:
-                    segments.append(segment_dict)
-        except BaseException:
-            pass
-        return segments, ignore_ttl
+        for item in sorted(raw, key=lambda item: item["segment"][0]):
+            start, end = item["segment"]
+            if segments and start - segments[-1]["end"] < 1:
+                previous = segments[-1]
+                previous["end"] = max(previous["end"], end)
+                previous["UUID"].append(item["UUID"])
+            else:
+                segments.append({"start": start, "end": end, "UUID": [item["UUID"]]})
+        return [s for s in segments if s["end"] - s["start"] > minimum_skip_length], ignore_ttl
 
     async def mark_viewed_segments(self, uuids):
         """Marks the segments as viewed in the SponsorBlock API
@@ -267,7 +239,8 @@ class ApiHelper:
             for i in uuids:
                 url = self.sponsorblock_api_url + "viewedVideoSponsorTime/"
                 params = {"UUID": i}
-                await self.web_session.post(url, params=params)
+                async with self.web_session.post(url, params=params) as response:
+                    await response.read()
 
     async def discover_youtube_devices_dial(self, active=True):
         """Discovers YouTube devices using DIAL and Chromecast discovery.
@@ -275,6 +248,8 @@ class ApiHelper:
         Yields devices as they are discovered instead of waiting for the full
         discovery cycle to finish.
         """
+        from . import chromecast_client, dial_client
+
         seen_screen_ids = set()
         async for device in merge_iterators(
             [

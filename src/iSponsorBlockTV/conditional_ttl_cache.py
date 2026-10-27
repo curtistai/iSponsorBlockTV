@@ -1,6 +1,7 @@
-import datetime
+import asyncio
+import time
+from functools import wraps
 
-from cache.key import KEY
 from cache.lru import LRU
 
 # MIT License
@@ -33,7 +34,7 @@ class AsyncConditionalTTL:
         def __init__(self, time_to_live, maxsize):
             super().__init__(maxsize=maxsize)
 
-            self.time_to_live = datetime.timedelta(seconds=time_to_live) if time_to_live else None
+            self.time_to_live = time_to_live
 
             self.maxsize = maxsize
 
@@ -41,7 +42,7 @@ class AsyncConditionalTTL:
             if key not in self.keys():
                 return False
             key_expiration = super().__getitem__(key)[1]
-            if key_expiration and key_expiration < datetime.datetime.now():
+            if key_expiration and key_expiration < time.monotonic():
                 del self[key]
                 return False
             return True
@@ -53,7 +54,7 @@ class AsyncConditionalTTL:
         def __setitem__(self, key, value):
             value, ignore_ttl = value  # unpack tuple
             ttl_value = (
-                (datetime.datetime.now() + self.time_to_live)
+                (time.monotonic() + self.time_to_live)
                 if (self.time_to_live and not ignore_ttl)
                 else None
             )  # ignore ttl if ignore_ttl is True
@@ -70,16 +71,30 @@ class AsyncConditionalTTL:
         self.skip_args = skip_args
 
     def __call__(self, func):
+        pending = {}
+
+        async def fetch(key, args, kwargs):
+            result = await func(*args, **kwargs)
+            self.ttl[key] = result
+            return result[0]
+
+        def finished(key, task):
+            pending.pop(key, None)
+            # Retrieve failures even when every caller has been cancelled.
+            if not task.cancelled():
+                task.exception()
+
+        @wraps(func)
         async def wrapper(*args, **kwargs):
-            key = KEY(args[self.skip_args :], kwargs)
+            key = (args[self.skip_args :], tuple(sorted(kwargs.items())))
             if key in self.ttl:
-                val = self.ttl[key]
-            else:
-                self.ttl[key] = await func(*args, **kwargs)
-                val = self.ttl[key]
-
-            return val
-
-        wrapper.__name__ += func.__name__
+                return self.ttl[key]
+            task = pending.get(key)
+            if task is None:
+                task = asyncio.create_task(fetch(key, args, kwargs))
+                pending[key] = task
+                task.add_done_callback(lambda done: finished(key, done))
+            # Playback updates may cancel one caller without cancelling shared prefetches.
+            return await asyncio.shield(task)
 
         return wrapper

@@ -7,7 +7,7 @@ import time
 import rich_click as click
 from appdirs import user_data_dir
 
-from . import config_setup, main, setup_wizard
+from . import main
 from .constants import config_file_blacklist_keys, github_wiki_base_url, SponsorBlock_api
 
 
@@ -185,6 +185,8 @@ def cli(ctx, data, debug, http_tracing, setup, setup_cli):
 @click.pass_context
 def setup_command(ctx):
     """Setup the program graphically"""
+    from . import setup_wizard
+
     config = Config(ctx.obj["data_dir"])
     config_path = config.config_file
     before_mtime_ns = None
@@ -212,6 +214,8 @@ def setup_command(ctx):
 def setup_cli_command(ctx):
     """Setup the program in the command line"""
     config = Config(ctx.obj["data_dir"])
+    from . import config_setup
+
     config_setup.main(config, ctx.obj["debug"])
 
 

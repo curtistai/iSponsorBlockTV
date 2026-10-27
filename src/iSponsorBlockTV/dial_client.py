@@ -372,14 +372,11 @@ async def discover(
         search_task.cancel()
         process_task.cancel()
         transport.close()
-        try:
-            await search_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await process_task
-        except asyncio.CancelledError:
-            pass
+        await asyncio.gather(search_task, process_task, return_exceptions=True)
+        # Probes otherwise outlive the discovery screen and keep HTTP sockets busy.
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

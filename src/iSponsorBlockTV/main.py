@@ -1,4 +1,5 @@
 import asyncio
+from copy import copy
 import logging
 import time
 from signal import SIGINT, SIGTERM, signal
@@ -62,21 +63,22 @@ class DeviceListener:
     # Method called on playback state change
     async def __call__(self, state):
         time_start = time.monotonic()
-        try:
+        if self.task:
             self.task.cancel()
-        except BaseException:
-            pass
-        self.task = asyncio.create_task(self.process_playstatus(state, time_start))
+        # The lounge reuses its PlaybackState object between events.
+        self.task = asyncio.create_task(self.process_playstatus(copy(state), time_start))
 
     # Processes the playback state change
     async def process_playstatus(self, state, time_start):
-        segments = []
-        if state.videoId:
+        if state.state.value != 1 or not state.videoId:
+            return
+        try:
             segments = await self.api_helper.get_segments(state.videoId)
-        if state.state.value == 1:  # Playing
-            self.logger.info("Playing video %s with %d segments", state.videoId, len(segments))
-            if segments:  # If there are segments
+            self.logger.debug("Playing video %s with %d segments", state.videoId, len(segments))
+            if segments:
                 await self.time_to_segment(segments, state.currentTime, time_start)
+        except Exception:
+            self.logger.warning("Could not process video %s", state.videoId, exc_info=True)
 
     # Finds the next segment to skip to and skips to it
     async def time_to_segment(self, segments, position, time_start):
@@ -94,11 +96,12 @@ class DeviceListener:
                 next_segment = segment
                 start_next_segment = position if is_within_start_range else segment_start
                 break
-        if start_next_segment:
+        if start_next_segment is not None:
             time_to_next = (
-                (start_next_segment - position - (time.monotonic() - time_start))
-                / self.lounge_controller.playback_speed
-            ) - self.offset
+                (start_next_segment - position) / self.lounge_controller.playback_speed
+                - (time.monotonic() - time_start)
+                - self.offset
+            )
             await self.skip(time_to_next, next_segment["end"], next_segment["UUID"])
 
     # Skips to the next segment (waits for the time to pass)
