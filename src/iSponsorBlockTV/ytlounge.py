@@ -61,7 +61,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.callback = None
         self._state_callback = None
         self._playback_state = PlaybackState()
-        self.logger = logger
+        self.logger = self._logger
         self.shorts_disconnected = False
         self.auto_play = True
         self.watchdog_running = False
@@ -70,6 +70,13 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self.mute_ads = config.mute_ads
             self.skip_ads = config.skip_ads
             self.auto_play = config.auto_play
+        self.mute_ads = config.mute_ads if config else False
+        self.skip_ads = config.skip_ads if config else False
+        self._ad_active = False
+        self._ad_muted = False
+        self._mute_target = None
+        self._mute_task = None
+        self._skip_tasks = set()
         self._command_mutex = asyncio.Lock()
 
     async def _handle_playback_state_event(self, event: PlaybackStateEvent) -> None:
@@ -158,36 +165,24 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         # A bunch of events useful to detect ads playing,
         # and the next video before it starts playing
         # (that way we can get the segments)
-        if event_type == "onStateChange":
+        if event_type == "nowPlaying":
             data = args[0]
-            # print(data)
-            # Unmute when the video starts playing
-            if self.mute_ads and data["state"] == "1":
-                create_task(self.mute(False, override=True))
-        elif event_type == "nowPlaying":
-            data = args[0]
-            # Unmute when the video starts playing
-            if self.mute_ads and data.get("state", "0") == "1":
-                self.logger.info("Ad has ended, unmuting")
-                create_task(self.mute(False, override=True))
+            if str(data.get("state")) == "1":
+                self._end_ad()
         elif event_type == "onAdStateChange":
             data = args[0]
-            if data["adState"] == "0" and data["currentTime"] != "0":  # Ad is not playing
-                self.logger.info("Ad has ended, unmuting")
-                create_task(self.mute(False, override=True))
-            elif (
-                self.skip_ads and data["isSkipEnabled"] == "true"
-            ):  # YouTube uses strings for booleans
-                self.logger.info("Ad can be skipped, skipping")
-                create_task(self.skip_ad())
-                create_task(self.mute(False, override=True))
-            elif self.mute_ads:  # Seen multiple other adStates, assuming they are all ads
-                self.logger.info("Ad has started, muting")
-                create_task(self.mute(True, override=True))
-        # Manages volume, useful since YouTube wants to know the volume
-        # when unmuting (even if they already have it)
+            if str(data.get("adState")) == "0":
+                self._end_ad()
+            else:
+                self._start_ad(data)
         elif event_type == "onVolumeChanged":
-            self.volume_state = args[0]
+            self.volume_state.update(args[0])
+            if (
+                self._ad_active
+                and self._ad_muted
+                and str(self.volume_state.get("muted")).lower() != "true"
+            ):
+                self._request_mute(True)
         # Gets segments for the next video before it starts playing
         elif event_type == "autoplayUpNext":
             if len(args) > 0 and (vid_id := args[0]["videoId"]):  # if video id is not empty
@@ -198,19 +193,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "adPlaying":
             data = args[0]
             # Gets segments for the next video (after the ad) before it starts playing
-            if vid_id := data["contentVideoId"]:
+            if vid_id := data.get("contentVideoId"):
                 self.logger.info(f"Getting segments for next video: {vid_id}")
                 create_task(self.api_helper.get_segments(vid_id))
-
-            if (
-                self.skip_ads and data["isSkipEnabled"] == "true"
-            ):  # YouTube uses strings for booleans
-                self.logger.info("Ad can be skipped, skipping")
-                create_task(self.skip_ad())
-                create_task(self.mute(False, override=True))
-            elif self.mute_ads:  # Seen multiple other adStates, assuming they are all ads
-                self.logger.info("Ad has started, muting")
-                create_task(self.mute(True, override=True))
+            self._start_ad(data)
 
         elif event_type == "loungeStatus":
             data = args[0]
@@ -243,6 +229,73 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
 
         await super()._process_event(event_type, args)
 
+    def _start_ad(self, data):
+        self._ad_active = True
+        if self.mute_ads:
+            if not self._ad_muted:
+                # Preserve a TV that was already muted by the user.
+                self._ad_muted = str(self.volume_state.get("muted", "false")).lower() != "true"
+            if self._ad_muted:
+                self._request_mute(True)
+        if self.skip_ads and str(data.get("isSkipEnabled")).lower() == "true":
+            task = create_task(self._skip_ad_safely())
+            self._skip_tasks.add(task)
+            task.add_done_callback(self._skip_tasks.discard)
+
+    async def _skip_ad_safely(self):
+        try:
+            await asyncio.wait_for(self.skip_ad(), timeout=10)
+        except Exception:
+            self.logger.warning("Ad skip failed", exc_info=True)
+
+    def _end_ad(self):
+        self._ad_active = False
+        if self._ad_muted:
+            self._request_mute(False)
+
+    def _request_mute(self, target):
+        self._mute_target = target
+        if self._mute_task is None or self._mute_task.done():
+            self._mute_task = create_task(self._apply_ad_mute())
+
+    async def _apply_ad_mute(self):
+        while self._mute_target is not None:
+            target = self._mute_target
+            try:
+                await asyncio.wait_for(self.mute(target, override=True), timeout=10)
+            except Exception:
+                self.logger.warning("Ad mute command failed; retrying", exc_info=True)
+                await asyncio.sleep(2)
+                continue
+            if self._mute_target == target:
+                self._mute_target = None
+                if not target:
+                    self._ad_muted = False
+
+    async def reset_connection(self):
+        """Discard stale session state without a network request during an outage."""
+        self.watchdog_running = False
+        tasks = [
+            self.subscribe_task,
+            self.subscribe_task_watchdog,
+            self._mute_task,
+            *self._skip_tasks,
+        ]
+        tasks = [task for task in tasks if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.subscribe_task = None
+        self.subscribe_task_watchdog = None
+        self._mute_task = None
+        self._mute_target = None
+        self._ad_active = False
+        # Keep ownership of an ad mute until fresh playback/ad events arrive.
+        # Retain the last known level so recovery never unmutes at a default 100%.
+        self.volume_state.pop("muted", None)
+        self._connection_lost()
+        self._lounge_token_expired()
+
     # Set the volume to a specific value (0-100)
     async def set_volume(self, volume: int) -> None:
         await self._command("setVolume", {"volume": volume})
@@ -263,12 +316,15 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         else:
             mute_str = "false"
         if override or not self.volume_state.get("muted", "false") == mute_str:
-            self.volume_state["muted"] = mute_str
             # YouTube wants the volume when unmuting, so we send it
-            await self._command(
+            success = await self._command(
                 "setVolume",
                 {"volume": self.volume_state.get("volume", 100), "muted": mute_str},
             )
+            if not success:
+                raise ConnectionError("TV did not accept volume command")
+            # This cache describes accepted commands, never failed attempts.
+            self.volume_state["muted"] = mute_str
 
     async def play_video(self, video_id: str) -> bool:
         return await self._command("setPlaylist", {"videoId": video_id})
@@ -280,7 +336,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     # the _command_offset (TODO: move to upstream if it works)
     async def _command(self, command: str, command_parameters: dict = None) -> bool:
         async with self._command_mutex:
-            return await super()._command(command, command_parameters)
+            return await asyncio.wait_for(super()._command(command, command_parameters), timeout=10)
 
     async def change_web_session(self, web_session: ClientSession):
         if self.session is not None:

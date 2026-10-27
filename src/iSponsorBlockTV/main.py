@@ -23,55 +23,41 @@ class DeviceListener:
             device.screen_id, config, api_helper, self.logger
         )
 
-    # Ensures that we have a valid auth token
-    async def refresh_auth_loop(self):
-        while True:
-            await asyncio.sleep(60 * 60 * 24)  # Refresh every 24 hours
-            try:
-                await self.lounge_controller.refresh_auth()
-            except BaseException:
-                pass
-
-    async def is_available(self):
-        try:
-            return await self.lounge_controller.is_available()
-        except BaseException:
-            return False
-
-    # Main subscription loop
+    # Each connection attempt obtains a fresh token; no daily refresh task is needed.
     async def loop(self):
-        lounge_controller = self.lounge_controller
-        while not self.cancelled:
-            while not lounge_controller.linked():
+        controller = self.lounge_controller
+        try:
+            while not self.cancelled:
                 try:
-                    self.logger.debug("Refreshing auth")
-                    await lounge_controller.refresh_auth()
-                except BaseException:
+                    await asyncio.wait_for(controller.refresh_auth(), timeout=30)
+                    if not controller.linked():
+                        raise ConnectionError("Could not refresh lounge token")
+                    if not await asyncio.wait_for(controller.is_available(), timeout=30):
+                        self.logger.debug("Waiting for device to be available")
+                    elif await asyncio.wait_for(controller.connect(), timeout=30):
+                        self.logger.info(
+                            "Connected to device %s (%s)", controller.screen_name, self.name
+                        )
+                        sub = await controller.subscribe_monitored(self)
+                        # Shield distinguishes watchdog cancellation from listener shutdown.
+                        try:
+                            await asyncio.shield(sub)
+                        except asyncio.CancelledError:
+                            if asyncio.current_task().cancelling():
+                                raise
+                            self.logger.warning("Subscription stalled; reconnecting")
+                except Exception:
+                    self.logger.warning("Connection failed; retrying in 10 seconds", exc_info=True)
+                finally:
+                    await controller.reset_connection()
+                    if self.task:
+                        self.task.cancel()
+                        await asyncio.gather(self.task, return_exceptions=True)
+                        self.task = None
+                if not self.cancelled:
                     await asyncio.sleep(10)
-            while not (await self.is_available()) and not self.cancelled:
-                self.logger.debug("Waiting for device to be available")
-                await asyncio.sleep(10)
-            try:
-                await lounge_controller.connect()
-            except BaseException:
-                pass
-            while not lounge_controller.connected() and not self.cancelled:
-                # Doesn't connect to the device if it's a kids profile (it's broken)
-                self.logger.debug("Waiting for device to be connected")
-                await asyncio.sleep(10)
-                try:
-                    await lounge_controller.connect()
-                except BaseException:
-                    pass
-            self.logger.info(
-                "Connected to device %s (%s)", lounge_controller.screen_name, self.name
-            )
-            try:
-                self.logger.debug("Subscribing to lounge")
-                sub = await lounge_controller.subscribe_monitored(self)
-                await sub
-            except BaseException:
-                pass
+        finally:
+            await controller.reset_connection()
 
     # Method called on playback state change
     async def __call__(self, state):
@@ -126,19 +112,10 @@ class DeviceListener:
 
     async def cancel(self):
         self.cancelled = True
-        await self.lounge_controller.disconnect()
+        await self.lounge_controller.reset_connection()
         if self.task:
             self.task.cancel()
-        if self.lounge_controller.subscribe_task_watchdog:
-            self.lounge_controller.subscribe_task_watchdog.cancel()
-        if self.lounge_controller.subscribe_task:
-            self.lounge_controller.subscribe_task.cancel()
-        await asyncio.gather(
-            self.task,
-            self.lounge_controller.subscribe_task_watchdog,
-            self.lounge_controller.subscribe_task,
-            return_exceptions=True,
-        )
+            await asyncio.gather(self.task, return_exceptions=True)
 
     async def initialize_web_session(self):
         await self.lounge_controller.change_web_session(self.web_session)
@@ -184,20 +161,17 @@ async def main_async(config, debug, http_tracing):
         devices.append(device)
         await device.initialize_web_session()
         tasks.append(loop.create_task(device.loop()))
-        tasks.append(loop.create_task(device.refresh_auth_loop()))
     signal(SIGTERM, handle_signal)
     signal(SIGINT, handle_signal)
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         print("Cancelling tasks and exiting...")
-        await finish(devices, web_session, tcp_connector)
+    finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        await web_session.close()
-        await tcp_connector.close()
+        await finish(devices, web_session, tcp_connector)
         print("Exited")
 
 
