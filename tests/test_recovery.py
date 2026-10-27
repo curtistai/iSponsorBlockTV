@@ -32,14 +32,59 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await api._mute_task
         self.assertEqual(api._command.call_args.args[1]["muted"], "false")
 
-    async def test_content_state_does_not_unmute_active_ad(self):
+    async def test_content_state_restores_audio_without_separate_ad_end_event(self):
         api = self.api()
         api._command = AsyncMock(return_value=True)
         api._start_ad({})
         await api._mute_task
         await self.event(api, "onStateChange", {"state": "1"})
+        await api._mute_task
+        self.assertFalse(api._ad_active)
+        self.assertEqual(api._command.await_count, 2)
+        self.assertEqual(api._command.call_args.args[1]["muted"], "false")
+
+    async def test_advertisement_playback_state_keeps_audio_muted(self):
+        api = self.api()
+        api._command = AsyncMock(return_value=True)
+        await self.event(api, "onStateChange", {"state": "1081"})
+        await api._mute_task
         self.assertTrue(api._ad_active)
-        self.assertEqual(api._command.await_count, 1)
+        self.assertEqual(api._command.call_args.args[1]["muted"], "true")
+
+    async def test_resume_event_with_real_dependency_restores_audio(self):
+        api = self.api()
+        api._command = AsyncMock(return_value=True)
+        api._start_ad({})
+        await api._mute_task
+        await api._process_event(
+            "onStateChange", [{"state": "1", "currentTime": "20", "duration": "300"}]
+        )
+        await api._mute_task
+        self.assertEqual(api._command.call_args.args[1]["muted"], "false")
+        self.assertFalse(api._ad_muted)
+
+    async def test_content_resume_retries_failed_unmute(self):
+        api = self.api()
+        api._command = AsyncMock(side_effect=[True, False, True])
+        api._start_ad({})
+        await api._mute_task
+        with patch("iSponsorBlockTV.ytlounge.asyncio.sleep", new=AsyncMock()):
+            await self.event(api, "onStateChange", {"state": "1"})
+            await api._mute_task
+        self.assertEqual(
+            [call.args[1]["muted"] for call in api._command.call_args_list],
+            ["true", "false", "false"],
+        )
+        self.assertFalse(api._ad_muted)
+
+    async def test_content_resume_preserves_preexisting_user_mute(self):
+        api = self.api()
+        api.volume_state = {"muted": "true", "volume": "30"}
+        api._command = AsyncMock()
+        api._start_ad({})
+        await self.event(api, "onStateChange", {"state": "1"})
+        self.assertIsNone(api._mute_task)
+        api._command.assert_not_called()
 
     async def test_failed_mute_does_not_change_cache(self):
         api = self.api()

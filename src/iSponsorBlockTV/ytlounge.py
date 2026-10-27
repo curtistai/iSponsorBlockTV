@@ -164,10 +164,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         # A bunch of events useful to detect ads playing,
         # and the next video before it starts playing
         # (that way we can get the segments)
-        if event_type == "nowPlaying":
+        if event_type in ("onStateChange", "nowPlaying"):
             data = args[0]
-            if str(data.get("state")) == "1":
+            state = str(data.get("state"))
+            if state == str(State.Playing.value):
+                # Some TVs resume content without a separate onAdStateChange/nowPlaying.
                 self._end_ad()
+            elif state == str(State.Advertisement.value):
+                self._start_ad(data)
         elif event_type == "onAdStateChange":
             data = args[0]
             if str(data.get("adState")) == "0":
@@ -266,6 +270,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     def _end_ad(self):
         self._ad_active = False
         if self._ad_muted:
+            self.logger.info("Content resumed or ad ended; restoring audio")
             self._request_mute(False)
 
     def _request_mute(self, target):
